@@ -1,0 +1,864 @@
+package com.amd.esb.agile.mbom.multicast;
+
+
+import org.apache.camel.LoggingLevel;
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.model.dataformat.ZipFileDataFormat;
+import org.apache.camel.support.builder.Namespaces;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import com.amd.esb.config.EmailConfig;
+import com.amd.esb.config.EmailSender;
+import com.amd.esb.config.LogTraceProcessor;
+
+@Component
+public class AgileFtpToMulticastMbom extends RouteBuilder {
+	
+	@Value("${com.amd.esb.agile.integration.agilesrc.username}")
+	private String userName;
+
+	@Value("${com.amd.esb.agile.integration.agilesrc.server}")
+	private String server;
+
+	@Value("${com.amd.esb.agile.integration.agilesrc.main.path}")
+	private String mbomPath;
+
+	@Value("${com.amd.esb.agile.integration.agilesrc.password}")
+	private String password;
+
+	@Value("${com.amd.esb.agile.integration.cronString}")
+	private String cron;
+	
+	@Value("${com.amd.esb.agile.integration.esb.cronString}")
+	private String esbCron;
+
+	@Value("${com.amd.esb.agile.integration.fileprefix}")
+	private String filePrefix;
+	
+	@Value("${xslt.path}")
+	private String xsltPath;
+	
+	@Value("${archive.path}")
+	private String archivePath;
+	
+	@Value("${stage.path}")
+	private String stagePath;
+
+	@Value("${tmp.path}")
+	private String tmpPath;
+	
+	@Value("${com.amd.esb.agile.integration.mail.from}")
+	private String from;
+	
+	@Value("${com.amd.esb.agile.integration.mail.to}")
+	private String to;
+	
+	@Value("${com.amd.esb.agile.integration.mail.smtpHost}")
+	private String host;
+	
+	@Value("${max.messageperpoll}")
+	private int maxPoll;
+	
+	@Autowired
+	EmailConfig emailConfig;
+
+	@Override
+	public void configure() throws Exception{
+
+		onException(Exception.class).maximumRedeliveries(10).redeliveryDelay(3600000)
+		.log("caught exception")
+		.handled(true)
+        .markRollbackOnly()
+        .useOriginalMessage()
+        .logStackTrace(true)
+		.retryAttemptedLogLevel(LoggingLevel.WARN).onRedelivery(emailConfig.emailNotification())
+		.log("************* Agile File ${headers.CamelFileName} Did Not Reach the Destination(s)**************")
+		.log("************* Continue Processing the File. Destination May Not Be Reachable********************");
+		
+		//Namespaces added
+		Namespaces ns = new Namespaces("agile","http://www.oracle.com/webfolder/technetwork/xml/plm/2016/09/");
+
+		interceptFrom().process(new LogTraceProcessor());
+				
+		//1A_FROM_AGILE_TO_AMD_FTP_MAIN
+		from("ftps://"+userName+"@"+server+mbomPath+"?password=RAW("+password+")&passiveMode=true&throwExceptionOnConnectFailed=true&connectTimeout=10000&maximumReconnectAttempts=0&move=archive&maxMessagesPerPoll="+maxPoll+"&moveFailed=.error&scheduler=spring&scheduler.cron="+cron+"&autoCreate=false&binary=true&sortBy=file:modified;file:name&disconnect=true&bridgeErrorHandler=true&include=.*.zip")							
+		.routeId("1A_FROM_AGILE_TO_AMD_FTP_MAIN")
+			.onException(Exception.class).log("caught exception in route 1A_FROM_AGILE_TO_AMD_FTP_MAIN")
+			.onExceptionOccurred(new EmailSender("Exception Occured in route 1A_FROM_AGILE_TO_AMD_FTP_MAIN", "Failed to connect to ftps server "+server+" , check user name or password or server name", to, from, host))
+			.end()
+			.log("[1A][1] Starting Main Route for Agile FTPS User Case")
+			.log("[1A][2] Received File(AXML):  ${headers.CamelFileName} ! with size ${headers.CamelFileLength} Bytes")
+			.multicast()
+			.to("file://"+stagePath+"1A_FROM_AGILE_TO_AMD_FTP_MAIN")
+			.log("[1A][3] Sent File to the Stage Folder: "+stagePath + "1A_FROM_AGILE_TO_AMD_FTP_MAIN")
+			.to("file://"+archivePath+"1A_FROM_AGILE_TO_AMD_FTP_MAIN")
+			.log("[1A][4] Sent File to the Archive Folder: "+archivePath + "1A_FROM_AGILE_TO_AMD_FTP_MAIN")
+			.end()
+			.log("[1A][5] Downloaded File(${headers.CamelFileName}) from FTPS to 1A_FROM_AGILE_TO_AMD_FTP_MAIN (STAGE and ARCHIVE) folder");
+			//.to("activemqA1:amd.agile.master.eco")
+			//.log("Staged Processed Message to Post Processing Queue: amd.agile.master.eco")
+		
+	
+		//From 1A_Replay/staging folder to MQ - Run every 10sec
+		from("file://" + stagePath + "1A_FROM_AGILE_TO_AMD_FTP_MAIN?sortBy=file:modified;file:name&delete=true&moveFailed=.error&scheduler=spring&scheduler.cron="+esbCron+"&maxMessagesPerPoll="+maxPoll)
+			.routeId("1A_FROM_AGILE_TO_AMD_STAGE")
+			.log("[1A][6] From 1A Stage or Replay to MQ amd.agile.master.eco")
+			.to("amqp:queue:testamd.agile.master.eco")
+			.log("[1A][7] Staged Message (${headers.CamelFileName}) to Post Processing Queue: amd.agile.master.eco")
+			.log("[1A][8] READY FOR DISTRIBUTION !!");
+		
+		//1C_FROM_AGILE_MASTER_TO_PREPROCESSING
+		from("amqp:queue:testamd.agile.master.eco")
+			.routeId("1C_FROM_AGILE_MASTER_TO_PREPROCESSING")
+			.log("[1C][1] Checking for Messages on Queue : amd.agile.master.eco")
+			.log("[1C][2] ${headers.CamelFileNameConsumed}")
+			.setProperty("envPrefix", simple(filePrefix))
+			.choice()
+			.when(simple("${headers.CamelFileNameConsumed} contains 'MBOMCO_${exchangeProperty.envPrefix}'"))
+				.log("[1C][3] Content Based Routing!! Detected MBOM Messsage ${headers.CamelFileName} for Processing!!")
+				.setHeader("ZipFileName", simple("${file:onlyname.noext}"))
+				.unmarshal(new ZipFileDataFormat())
+				.setHeader("CamelFileName", simple("${headers.ZipFileName}.xml"))
+				.to("file://" + tmpPath + "1C_FROM_AGILE_MASTER_TO_PREPROCESSING")
+				.log("[1C][3] file unzipped and sent file to TMP folder: "+tmpPath+"1C_FROM_AGILE_MASTER_TO_PREPROCESSING")
+			.otherwise()
+				.log("[1C][6] Agile Message ${headers.CamelFileName} did not meet the file naming criteria and has been dropped !!");
+
+		from("file://" + tmpPath + "1C_FROM_AGILE_MASTER_TO_PREPROCESSING?sortBy=file:modified;file:name&delete=true&moveFailed=.error&scheduler=spring&scheduler.cron="+esbCron+"&maxMessagesPerPoll="+maxPoll)
+				.routeId("1C_FROM_TMP_FOLDER_TO_PRE_DISTRIBUTION")
+				.log("[1C][4] Message ${headers.CamelFileName} received from TMP folder For Processing")
+				.choice()
+					.when(xpath("/agile:AgileData/agile:ChangeOrders", String.class, ns))
+						.setHeader("ECONumber",
+						xpath("/agile:AgileData/agile:ChangeOrders/agile:CoverPage/agile:Number/text()", String.class, ns))
+					.when(xpath("/agile:AgileData/agile:ManufacturerOrders", String.class, ns))
+						.setHeader("ECONumber",
+						xpath("/agile:AgileData/agile:ManufacturerOrders/agile:CoverPage/agile:Number/text()", String.class, ns))
+					.when(xpath("/agile:AgileData/agile:Deviations", String.class, ns))
+						.setHeader("ECONumber",
+						xpath("/agile:AgileData/agile:Deviations/agile:CoverPage/agile:Number/text()", String.class, ns))
+					.when(xpath("/agile:AgileData/agile:StopShips", String.class, ns))
+						.setHeader("ECONumber",
+						xpath("/agile:AgileData/agile:StopShips/agile:CoverPage/agile:Number/text()", String.class, ns))
+				.end() // end of choice()
+				.setHeader("currentTimestamp", simple("${date:now:yyyyMMdd_HHmmss}"))
+				.setHeader("currentTimestampMsec", simple("${date:now:yyyyMMdd_HHmmssSSS}"))
+				.setHeader("CamelFileName", simple("MBOM_CO_${headers.ECONumber}_${headers.currentTimestampMsec}.xml"))
+				.process(new LogTraceProcessor())
+				.to("amqp:queue:testamd.agile.master.eco.renamed")
+				.log("[1C][5] Message Renamed and Placed in Queue: amd.agile.master.eco.renamed");
+		
+		
+//		1D_FROM_AGILE_MASTER_TO_PRE_DISTRIBUTION
+		from("amqp:queue:testamd.agile.master.eco.renamed")
+			.routeId("1D_FROM_AGILE_MASTER_TO_PRE_DISTRIBUTION")
+			.log("[1D][1] Checking for Messages on Queue : amd.agile.master.eco.renamed")
+			.log("[1D][2] Detected Messsage ${headers.CamelFileNameOnly} :: ${headers.CamelFileName} for pickup")
+			.multicast()
+				.to("amqp:queue:testamd.agile.master.eco.raw.preprocess")
+					.log("[1D][3] Staged Message to Queue: amd.agile.master.eco.raw.preprocess")
+					.log("[1D][4] Ready For Raw AXML Preprocess Distribution")
+					
+				.to("amqp:queue:testamd.agile.master.eco.transformed.preprocess")
+					.log("[1D][5] Staged Message to Queue: amd.agile.master.eco.transformed.preprocess")
+					.log("[1D][6] Ready For Transformed AXML Preprocess Distribution");
+		
+		
+//		2A_FROM_AGILE_MASTER_RAW_TO_DISTRIBUTION_POINTS
+		from("amqp:queue:testamd.agile.master.eco.raw.preprocess")
+			.routeId("2A_FROM_AGILE_MASTER_RAW_TO_DISTRIBUTION_POINTS")
+			.log("[2A][1] Checking for Messages on Master queue (Raw) : amd.agile.master.eco.raw.preprocess")
+			.log("[2A][2] Detected Messsage  ${headers.CamelFileNameOnly} :: ${headers.CamelFileName} for Master pickup")
+			.marshal(new ZipFileDataFormat())
+			.log("[2A][3] Raw Message Zipped Back for Further Processing")
+			.log("[2A][4] Attempting Distribution to Downstream Pickup for Messages on Queue : amd.agile.master.eco.raw.preprocess")
+			.multicast()
+				.to("amqp:queue:testamd.agile.camstar.png.eco.preprocess")
+				.log("[2A][5] Staged Message to amd.agile.camstar.png.eco.preprocess For ESB Distribution")
+				.log("[2A][6] Ready For Camstar(PNG) Preprocess Distribution")
+				
+				.to("amqp:queue:testamd.agile.camstar.suz.eco.preprocess")
+				.log("[2A][7] Staged Message to amd.agile.camstar.suz.eco.preprocess For ESB Distribution")
+				.log("[2A][8] Ready For Camstar(SUZ) Preprocess Distribution")
+				
+				.to("amqp:queue:testamd.agile.inca.eco.preprocess")
+				.log("[2A][9] Staged Message to amd.agile.inca.eco.preprocess For ESB Distribution")
+				.log("[2A][10] Ready For INCA Preprocess Distribution")
+
+				.to("amqp:queue:testamd.agile.bat.eco.preprocess")
+				.log("[2A][11] Staged Message to amd.agile.bat.eco.preprocess For ESB Distribution")
+				.log("[2A][12] Ready For BAT Preprocess Distribution")
+
+				.to("amqp:queue:testamd.agile.bat.tmp.eco.preprocess")
+				.log("[2A][13] Staged Message to amd.agile.bat.tmp.eco.preprocess For ESB Distribution")
+				.log("[2A][14] Ready For TMP BOM(BAT) Preprocess Distribution")
+
+				.to("amqp:queue:testamd.agile.bat.wafer.eco.preprocess")
+				.log("[2A][15] Staged Message to amd.agile.bat.wafer.eco.preprocess For ESB Distribution")
+				.log("[2A][16] Ready For BAT Preprocess Distribution")
+
+				.to("amqp:queue:testamd.agile.po.eco.preprocess")
+				.log("[2A][17] Staged Message to amd.agile.po.eco.preprocess For ESB Distribution")
+				.log("[2A][18] Ready For PO Preprocess Distribution");
+		
+//		2B_FROM_AGILE_MASTER_TRANSFORMED_TO_DISTRIBUTION_POINTS
+		from("amqp:queue:testamd.agile.master.eco.transformed.preprocess")
+			.routeId("2B_FROM_AGILE_MASTER_TRANSFORMED_TO_DISTRIBUTION_POINTS")
+			.log("[2B][1] Checking for Messages on Master queue (Transformed) : amd.agile.master.eco.transformed.preprocess ")
+			.log("[2B][2] Detected Messsage  ${headers.CamelFileNameOnly} :: ${headers.CamelFileName} for Master pickup ")
+			.log("[2B][3] Attempting Distribution to Downstream Pickup for Messages on Queue : amd.agile.master.eco.transformed.preprocess")
+			.to("xslt-saxon:file://" + xsltPath + "Agile_to_Agile_Transform.xslt?contentCache=false")
+			.log("[2B][4] Agile Message Transformed after pickup")
+			.marshal(new ZipFileDataFormat())
+			.log("[2B][5] Transformed Message Zipped Back for Further Processing")
+			.multicast()
+				.to("amqp:queue:testamd.agile.loadit.eco.preprocess")
+				.log("[2B][6] Staged Message to amd.agile.loadit.eco.preprocess For ESB Distribution")
+				.log("[2B][7] Ready For Loadit Preprocess Distribution")
+
+				.to("amqp:queue:testamd.agile.informatica.eco.preprocess")
+				.log("[2B][8] Staged Message to amd.agile.informatica.eco.preprocess For ESB Distribution")
+				.log("[2B][9] Ready For Informatica Preprocess Distribution")
+
+				.to("amqp:queue:testamd.agile.cpru.eco.preprocess")
+				.log("[2B][10] Staged Message to amd.agile.cpru.eco.preprocess For ESB Distribution")
+				.log("[2B][11] Ready For cPRU Preprocess Distribution")
+
+				.to("amqp:queue:testamd.agile.syspro.eco.preprocess")
+				.log("[2B][12] Staged Message to amd.agile.syspro.eco.preprocess For ESB Distribution")
+				.log("[2B][13] Ready For Syspro Preprocess Distribution");
+
+		
+	}
+}
+===========
+package com.amd.esb.agile;
+
+import org.apache.camel.CamelContext;
+import org.apache.camel.ExchangePattern;
+import org.apache.camel.LoggingLevel;
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.component.cxf.common.message.CxfConstants;
+import org.apache.camel.component.cxf.jaxws.CxfComponent;
+import org.apache.camel.component.cxf.jaxws.CxfConfigurer;
+import org.apache.camel.component.cxf.jaxws.CxfEndpoint;
+import org.apache.camel.impl.DefaultCamelContext;
+import org.apache.camel.support.builder.Namespaces;
+import org.apache.cxf.endpoint.Client;
+import org.apache.cxf.endpoint.Server;
+import org.apache.cxf.frontend.AbstractWSDLBasedEndpointFactory;
+import org.apache.cxf.transport.http.HTTPConduit;
+import org.apache.cxf.transports.http.configuration.HTTPClientPolicy;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.stereotype.Component;
+
+import com.amd.esb.agile.config.EmailConfig;
+import com.amd.esb.agile.config.LogTraceProcessor;
+
+@Component
+public class CpruAgileIntegration extends RouteBuilder {
+	
+	private static final Logger logger = LogManager.getLogger(CpruAgileIntegration.class);
+	
+	@Value("${stage.path}")
+	private String stagePath;
+
+	@Value("${archive.path}")
+	private String archivePath;
+
+	@Value("${com.amd.esb.agile.integration.inbound.jetty.cpru.add.url}")
+	private String jettyCpruAddUrl;
+
+	@Value("${com.amd.esb.agile.integration.inbound.jetty.cpru.upd.url}")
+	private String jettyCpruUpdUrl;
+
+	@Value("${com.amd.esb.agile.integration.inbound.jetty.cpru.epx.url}")
+	private String jettyCpruEpxUrl;
+
+	@Value("${com.amd.esb.agile.integration.inbound.jetty.cpru.mwur.url}")
+	private String jettyCpruMwurUrl;
+
+	@Value("${com.amd.esb.agile.integration.inbound.jetty.cpru.mwur.asm.url}")
+	private String jettyCpruAsmMwurUrl;
+
+	@Value("${com.amd.esb.agile.integration.inbound.jetty.cpru.tmp.bat.add.url}")
+	private String jettyCpruTmpBatAddUrl;
+	
+	@Value("${xslt.path}")
+	private String xsltPath;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.ts0015.wsdl}")
+	private String inboundTs0015Wsdl;
+
+	@Value("${com.amd.esb.agile.integration.inbound.ts0015.url}")
+	private String inboundTs0015Url;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.ts0015.username.cpru}")
+	private String inboundTs0015UsernameCpru;
+
+	@Value("${com.amd.esb.agile.integration.inbound.ts0015.password.cpru}")
+	private String inboundTs0015PasswordCpru;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.cpru.duration}")
+	private String cpruDuration;
+    
+    @Value("${com.amd.esb.agile.integration.inbound.cpru.maximumredeliveries}")
+	private String cpruMaximumredeliveries;
+    
+    @Value("${com.amd.esb.agile.integration.inbound.epx.url}")
+	private String epxUrl;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.epx.wsdl}")
+	private String epxWsdl;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.epx.username}")
+	private String epxUsername;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.epx.password}")
+	private String epxPassword;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.mwur.url}")
+	private String mwurUrl;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.mwur.wsdl}")
+	private String mwurWsdl;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.mwur.username}")
+	private String mwurUsername;
+	
+	@Value("${com.amd.esb.agile.integration.inbound.mwur.password}")
+	private String mwurPassword;
+    
+	@Autowired
+	EmailConfig emailConfig;
+
+	@Override
+	public void configure() throws Exception {
+
+		onException(Exception.class).maximumRedeliveries(10).redeliveryDelay(3600000)
+				.log("caught exception")
+				.handled(true)
+				.markRollbackOnly()
+				.useOriginalMessage()
+				.logStackTrace(true)
+				.retryAttemptedLogLevel(LoggingLevel.WARN).onRedelivery(emailConfig.emailNotification())
+				.log("************* Agile File ${headers.CamelFileName} Did Not Reach the Destination(s)**************")
+				.log("************* Continue Processing the File. Destination May Not Be Reachable********************");
+
+		// Added namespaces
+		Namespaces ns = new Namespaces("agl", "http://www.xmlns3.amd.com/agile/ws/MultilevelWhereUsedReportService")
+				.add("ns2", "http://www.agile.com/ais/export")
+				.add("xop", "http://www.w3.org/2004/08/xop/include")
+				.add("epx","http://www.xmlns3.amd.com/agile/ws/ExportPartService")
+				.add("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+				.add("cxf", "http://camel.apache.org/schema/cxf");
+		
+		interceptFrom().process(new LogTraceProcessor());
+		// 6IN1_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING
+		from("jetty:" + jettyCpruAddUrl
+				+ "?restletMethods=GET,POST,PUT,DELETE&continuationTimeout=15000")
+			.routeId("6IN1_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING")
+			.setExchangePattern(ExchangePattern.InOnly).convertBodyTo(String.class)
+			.choice()
+			.when(simple("${header.CamelHttpMethod} == 'POST'"))
+				.log("[6IN1][1] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.log("[6IN1][2] Received message on ESB jetty server from CPRU for CREATE request")
+				.setExchangePattern(ExchangePattern.InOnly)
+				.setProperty("PartNumberSubstring").simple("${body.substring(${body.indexOf(\"Name,\")})}")
+				.setProperty("PartNumber")
+				.simple("${exchangeProperty.PartNumberSubstring.substring(5,${exchangeProperty.PartNumberSubstring.indexOf(\"|~|\")})}")
+				.setProperty("PRUDataStartSubstring").simple("${body.substring(${body.indexOf(\"PRUDataStart,\")})}")
+				.setProperty("PRUDataStart")
+				.simple("${exchangeProperty.PRUDataStartSubstring.substring(13,${exchangeProperty.PRUDataStartSubstring.indexOf(\"|~|\")})}")
+				.log("Received request with Part Number: ${exchangeProperty.PartNumber}")
+				
+				.setHeader("CamelFileName", simple("CPRU_CREATE_${exchangeProperty.PartNumber}_${date:now:yyyyMMdd_HHmmss}"))
+				.process(new LogTraceProcessor())
+				.to("file://" + stagePath + "6IN1_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING")
+				.log("[6IN1][3] sent file to STAGE folder: //" + stagePath
+						+ "6IN1_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING")
+				.to("file://" + archivePath + "6IN1_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING")
+				.log("[6IN1][4] Stored file to ARCHIVE folder: //" + archivePath
+						+ "6IN1_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING")
+				.log("[6IN1][5] Ready For Agile Web Service Invocation !")
+				.transform(simple(
+						"OK! POST endpoint reached for cPRU Inbound (CREATE) having Transaction-ID# PRUDataStart,${exchangeProperty.PRUDataStart}::Name,${exchangeProperty.PartNumber} !!"))
+				.log("[6IN1][6] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'GET'"))
+				.log("[6IN1][7] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple("OK! GET endpoint reached for cPRU Inbound (CREATE)!!"))
+				.log("[6IN1][8] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'PUT'"))
+				.log("[6IN1][9] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple("OK! PUT endpoint reached for cPRU Inbound (CREATE)!!"))
+				.log("[6IN1][10] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'DELETE'"))
+				.log("[6IN1][11] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple("OK! DELETE endpoint reached for cPRU Inbound (CREATE)!!"))
+				.log("[6IN1][12] AFTER METHOD: ${header.CamelHttpMethod}");
+
+		// 6IN3_FROM_CPRU_INBOUND_UPDATE_TO_PRE_PROCESSING
+		from("jetty:" + jettyCpruUpdUrl
+				+ "?restletMethods=GET,POST,PUT,DELETE&continuationTimeout=15000")
+			.routeId("6IN3_FROM_CPRU_INBOUND_UPDATE_TO_PRE_PROCESSING")
+			.setExchangePattern(ExchangePattern.InOnly)
+			.convertBodyTo(String.class)
+			.choice()
+			.when(simple("${header.CamelHttpMethod} == 'POST'"))
+				.log("[6IN3][1] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.log("[6IN3][2] Received message on ESB jetty server from CPRU for UPDATE part request")
+
+				.setExchangePattern(ExchangePattern.InOnly)
+				.setProperty("PartNumberSubstring").simple("${body.substring(${body.indexOf(\"Name,\")})}")
+				.setProperty("PartNumber")
+				.simple("${exchangeProperty.PartNumberSubstring.substring(5,${exchangeProperty.PartNumberSubstring.indexOf(\"|~|\")})}")
+				.setProperty("PRUDataStartSubstring").simple("${body.substring(${body.indexOf(\"PRUDataStart,\")})}")
+				.setProperty("PRUDataStart")
+				.simple("${exchangeProperty.PRUDataStartSubstring.substring(13,${exchangeProperty.PRUDataStartSubstring.indexOf(\"|~|\")})}")
+				.log("Received request with Part Number: ${exchangeProperty.PartNumber}")
+				
+				.setHeader("CamelFileName", simple("CPRU_UPDATE_${exchangeProperty.PartNumber}_${date:now:yyyyMMdd_HHmmss}"))
+				.process(new LogTraceProcessor())
+				.to("file://" + stagePath + "6IN3_FROM_CPRU_INBOUND_UPDATE_TO_PRE_PROCESSING")
+				.log("[6IN3][3] sent file to STAGE folder: //" + stagePath
+						+ "6IN3_FROM_CPRU_INBOUND_UPDATE_TO_PRE_PROCESSING")
+				.to("file://" + archivePath + "6IN3_FROM_CPRU_INBOUND_UPDATE_TO_PRE_PROCESSING")
+				.log("[6IN3][4] Stored file to ARCHIVE folder: //" + archivePath
+						+ "6IN3_FROM_CPRU_INBOUND_UPDATE_TO_PRE_PROCESSING")
+				.log("[6IN3][5] Ready For Agile Web Service Invocation !")
+				.transform()
+				.simple("OK! POST endpoint reached for cPRU Inbound (UPDATE) having Transaction-ID# PRUDataStart,${exchangeProperty.PRUDataStart}::Name,${exchangeProperty.PartNumber} !!")
+				.log("[6IN3][6] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'GET'"))
+				.log("[6IN3][7] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple("OK! GET endpoint reached for cPRU Inbound (UPDATE)!!"))
+				.log("[6IN3][8] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'PUT'"))
+				.log("[6IN3][9] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform().simple("OK! PUT endpoint reached for cPRU Inbound (UPDATE)!!")
+				.log("[6IN3][10] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'DELETE'"))
+				.log("[6IN3][11] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform().simple("OK! DELETE endpoint reached for cPRU Inbound (UPDATE)!!")
+				.log("[6IN3][12] AFTER METHOD: ${header.CamelHttpMethod}");
+
+		// 9E1_FROM_CPRU_INBOUND_TO_AGILE_EXPORTPARTXML
+		from("jetty:" + jettyCpruEpxUrl
+				+ "?restletMethods=GET,POST,PUT,DELETE&continuationTimeout=30000")
+			.routeId("9E1_FROM_CPRU_INBOUND_TO_AGILE_EXPORTPARTXML")
+			.setExchangePattern(ExchangePattern.InOnly).convertBodyTo(String.class)
+			.choice()
+			.when(simple("${header.CamelHttpMethod} == 'POST'"))
+				.log("[9E1][1] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.log("[9E1][2] Received message on ESB JETTY server from CPRU for export part")
+				.log("[9E1][3] sending request to ESB STAGE and ARCHIVE folder")
+
+				.choice()
+				.when(xpath("/epx:exportPartXML/epx:itemNumber/text()",ns))
+					.setProperty("itemNumber",xpath("/epx:exportPartXML/epx:itemNumber/text()",ns))
+				.endChoice()
+				.setHeader("CamelFileName", simple("CPRU_EXPORT_PART_${exchangeProperty.itemNumber}_${date:now:yyyyMMdd_HHmmss}"))
+				.process(new LogTraceProcessor())
+
+				.to("file://" + archivePath + "9E1_FROM_CPRU_INBOUND_TO_AGILE_EXPORTPARTXML")
+				.log("[9E1][4] Stored file to ARCHIVE folder: //" + archivePath
+						+ "9E1_FROM_CPRU_INBOUND_TO_AGILE_EXPORTPARTXML")
+
+				.choice()
+			    	.when(xpath("/epx:exportPartXML/epx:itemNumber/text()",ns))
+			    		.setProperty("itemNumber",xpath("/epx:exportPartXML/epx:itemNumber/text()",ns))
+			    		.log("[9E1][5] Received ExportPartXML Request from cPRU via HTTP-POST !") 
+			    		.log("[9E1][6] Logging Raw ExportPartXML Request for ItemNumber:${exchangeProperty.itemNumber} : ${body}")
+			    		.to("xslt-saxon:file://"+xsltPath+"ExportPartXML_cPRU_to_Agile_WS_Transform.xslt?contentCache=false")
+			    		.log("[9E1][7] ExportPartXML Request Message Transformed to Agile WS format for ItemNumber:${exchangeProperty.itemNumber} : ${body}")
+			    		.log("[9E1][8] Invoking Agile web-service to send cPRU ExportPartXML Request..")
+			    		.log(epxUrl)
+			    		.setHeader(CxfConstants.OPERATION_NAME,simple("exportpartXML"))
+				      
+			    		.to("cxf:bean:serviceEndpointCPRUExportPart?wsdlURL="+epxWsdl+"&dataFormat=PAYLOAD")
+			    		.setProperty("responseItemNumber",xpath("/epx:exportpartXMLResponse/epx:exportpartXML/itemNumber/text()",ns))
+			    		.setProperty("responseMessage",xpath("responseMessage"))
+			    		.log("[9E1][9] Logging WebService Response for ExportPartXML for ItemNumber:${exchangeProperty.responseItemNumber}: ${body}")
+			    		.choice()
+				      		.when(xpath("/epx:exportpartXMLResponse/epx:exportpartXML/xmlStr/text()",ns))
+					            .setProperty("xmlString",xpath("/epx:exportpartXMLResponse/epx:exportpartXML/xmlStr/text()",ns))
+					            .setBody(simple("${exchangeProperty.xmlString}"))
+					            .convertBodyTo(String.class)
+					            .to("xslt-saxon:file://"+xsltPath+"Agile_to_Agile_Transform.xslt?contentCache=false")
+					            .setBody(simple("<Response><itemNumber>${exchangeProperty.responseItemNumber}</itemNumber><responseMessage>${exchangeProperty.responseMessage}</responseMessage>${body}</Response>"))		            
+				            .otherwise()
+				            	.setBody(simple("${exchangeProperty.responseMessage}"))
+				        .endChoice()
+				        .log("[9E1][10] Delivered WebService Response to cPRU (ExportPartXML) for itemNumbers :: ${exchangeProperty.responseItemNumber}:: with response message ::${exchangeProperty.responseMessage} !!")
+				  
+				    .otherwise()
+				      .setBody(simple("ExportPartXML Inbound Message did not meet the required format and has been dropped!! ${body}"))
+				      .log("[9E1][11] ExportPartXML Inbound Message did not meet the required format and has been dropped!! ${body}")	
+				.endChoice()
+
+				.log("[9E1][12] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'GET'"))
+				.log("[9E1][13] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple(" OK! GET endpoint reached for cPRU Inbound (ExportPartXML)!!"))
+				.log("[9E1][14] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'PUT'"))
+				.log("[9E1][15] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple("OK! PUT endpoint reached for cPRU Inbound (ExportPartXML)!!"))
+				.log("[9E1][16] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'DELETE'"))
+				.log("[9E1][17] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple("OK! DELETE endpoint reached for cPRU Inbound (ExportPartXML)!!"))
+				.log("[9E1][18] AFTER METHOD: ${header.CamelHttpMethod}")
+			.endChoice(); // End of Outer choice
+
+		// 9IN1_FROM_CPRU_INBOUND_TO_AGILE_MULTILEVEL
+		from("jetty:" + jettyCpruMwurUrl
+				+ "?restletMethods=GET,POST,PUT,DELETE&continuationTimeout=15000")
+			.routeId("9IN1_FROM_CPRU_INBOUND_TO_AGILE_MULTILEVEL")
+			.setExchangePattern(ExchangePattern.InOnly).convertBodyTo(String.class)
+			.choice()
+			.when(simple("${header.CamelHttpMethod} == 'POST'"))
+				.log("[9IN1][1] Received file ${headers.CamelFileName} on ESB JETTY server from CPRU for MultilevelWhereUsedReport")
+				.log("[9IN1][2] Received MultilevelWhereUsedReport Request from cPRU via HTTP-POST !")
+				.log("[9IN1][3] sending request to ESB STAGE and ARCHIVE folder")
+				.setProperty("itemNumber").xpath("/agl:fetchWhereUsedReport/itemNumber/text()", String.class, ns)
+				.log("[9IN1][4] Received request with itemNumber: ${exchangeProperty.itemNumber}")
+				.setHeader("CamelFileName", simple("CPRU_MULTI_LEVEL_${exchangeProperty.itemNumber}_${date:now:yyyyMMdd_HHmmss}"))
+				.process(new LogTraceProcessor())
+
+				.to("file://" + archivePath + "9IN1_FROM_CPRU_INBOUND_TO_AGILE_MULTILEVEL")
+				.log("[9IN1][5] Stored file to ARCHIVE folder: //" + archivePath
+						+ "9IN1_FROM_CPRU_INBOUND_TO_AGILE_MULTILEVEL")
+				
+				.convertBodyTo(String.class)
+//				Note - No need to set itemNumber in exchange property again as are using same Exchange in below
+//				.setProperty("itemNumber").xpath("/agl:fetchWhereUsedReport/itemNumber/text()", String.class, ns)
+				.log("[9IN1][6] Logging input to Agile WS (MultilevelWhereUsedReport) for ItemNumber:${exchangeProperty.itemNumber}: ${body}")
+				.log("[9IN1][7] Invoking Agile web-service to send cPRU Request..")
+				.log("[9IN1][8] URL:"+mwurUrl)
+				.setHeader("operationName").simple("fetchWhereUsedReport")
+				.to("cxf:bean:serviceEndpointAgileMultilevel?wsdlURL=" + mwurWsdl + "&dataFormat=PAYLOAD")
+				.log("[9IN1][9] Logging WebService Response for ItemNumber:${exchangeProperty.itemNumber}: ${body}")
+				.setProperty("responseMessage")
+				.xpath("/agl:fetchWhereUsedReportResponse/agl:fetchWhereUsedReport/responseMessage/text()", ns)
+		        .choice()
+		           .when(xpath("/agl:fetchWhereUsedReportResponse/agl:fetchWhereUsedReport/byteData",ns))
+			          .setProperty("byteData")
+				      .xpath("/agl:fetchWhereUsedReportResponse/agl:fetchWhereUsedReport/byteData/text()",ns)
+			          .setBody().simple("${exchangeProperty.byteData}")
+			          .log("[9IN1][10] Converting byteData from Base64 to String (unmarshal)")
+			          .unmarshal().base64()
+			          .log("[9IN1][11] WebService Response transformed to cPRU format for ItemNumber:${exchangeProperty.itemNumber}: ${body}")
+			          .transform().simple("${body}")
+			          .log("[9IN1][12] Delivered WebService Response to cPRU (MultilevelWhereUsedReport) !")
+		        .otherwise()
+			       .setBody()
+				   .simple("${exchangeProperty.responseMessage}")
+			       .log("[9IN1][13] WebService Response transformed to cPRU format for ItemNumber:${exchangeProperty.itemNumber}: ${body}")
+			       .log("[9IN1][14] Agile WebService returned ::No Where Used Items:: for ItemNumber:${exchangeProperty.itemNumber}!!")
+			       .transform().simple("${body}")
+			       .log("[9IN1][15] Delivered WebService Response to cPRU (MultilevelWhereUsedReport) !")
+			       .endChoice()
+				.log("[9IN1][16] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'GET'"))
+				.log("[9IN1][17] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform().simple("OK! GET endpoint reached for cPRU Inbound (MultilevelWhereUsedReport)!!")
+				.log("[9IN1][18] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'PUT'"))
+				.log("[9IN1][19] BEFORE METHOD: ${header.CamelHttpMethod}").transform()
+				.simple("OK! PUT endpoint reached for CPRU Inbound (MultilevelWhereUsedReport)!!")
+				.log("[9IN1][20] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'DELETE'"))
+				.log("[9IN1][21] BEFORE METHOD: ${header.CamelHttpMethod}").transform()
+				.simple(" OK! DELETE endpoint reached for CPRU Inbound (MultilevelWhereUsedReport)!!")
+				.log("[9IN1][22] AFTER METHOD: ${header.CamelHttpMethod}")
+			.endChoice();
+
+		// 9IN2_FROM_CPRU_INBOUND_TO_AGILE_MULTILEVEL_ASSEMBLY
+		from("jetty:" + jettyCpruAsmMwurUrl
+				+ "?restletMethods=GET,POST,PUT,DELETE&continuationTimeout=15000")
+			.routeId("9IN2_FROM_CPRU_INBOUND_TO_AGILE_MULTILEVEL_ASSEMBLY")
+			.setExchangePattern(ExchangePattern.InOnly).convertBodyTo(String.class)
+			.choice()
+			.when(simple("${header.CamelHttpMethod} == 'POST'"))
+				.log("[9IN2][1] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.log("[9IN2][2] Received MultilevelWhereUsedAssemblyReport Request from cPRU via HTTP-POST !")
+				.log("[9IN2][3] storing file to ESB ARCHIVE folder")
+				
+				.setProperty("itemNumber")
+				.xpath("/agl:fetchWhereUsedAndAssemblyAttributesReport/itemNumber/text()",String.class, ns)
+				
+				.setHeader("CamelFileName", simple("CPRU_MULTI_LEVEL_ASSEMBLY_${exchangeProperty.itemNumber}_${date:now:yyyyMMdd_HHmmss}"))
+				.process(new LogTraceProcessor())
+
+				.to("file://" + archivePath + "9IN2_FROM_CPRU_INBOUND_TO_AGILE_MULTILEVEL_ASSEMBLY")
+				.log("[9IN2][4] Stored file to ARCHIVE folder: //" + archivePath
+						+ "9IN2_FROM_CPRU_INBOUND_TO_AGILE_MULTILEVEL_ASSEMBLY")
+				
+//				Note - No need to set itemNumber in exchange property again as are using same Exchange in below 
+//				.setProperty("itemNumber")
+//				.xpath("/agl:fetchWhereUsedAndAssemblyAttributesReport/itemNumber/text()",String.class, ns)
+				.log("[9IN2][5] Logging input to Agile WS (MultilevelWhereUsedAssemblyReport) for ItemNumber:${exchangeProperty.itemNumber}: ${body}")
+				.log("[9IN2][6] Invoking Agile web-service to send cPRU Request..")
+				.log("[9IN1][7] Url:"+mwurUrl)
+				.setHeader("operationName")
+				.simple("fetchWhereUsedAndAssemblyAttributesReport")
+			   
+				.to("cxf:bean:serviceEndpointAgileMultilevel?wsdlURL=" +mwurWsdl+ "&dataFormat=PAYLOAD")
+				.log("[9IN2][8] Logging WebService Response for ItemNumber:${exchangeProperty.itemNumber}: ${body}")
+				.setProperty("responseMessage")
+				.xpath("/agl:fetchWhereUsedAndAssemblyAttributesReportResponse/agl:fetchWhereUsedAndAssemblyAttributesReport/responseMessage/text()",ns)
+				.choice()
+					.when(xpath("/agl:fetchWhereUsedAndAssemblyAttributesReportResponse/agl:fetchWhereUsedAndAssemblyAttributesReport/byteData",ns))
+					    .setProperty("byteData")
+						.xpath("/agl:fetchWhereUsedAndAssemblyAttributesReportResponse/agl:fetchWhereUsedAndAssemblyAttributesReport/byteData/text()",ns)
+					    .setBody().simple("${exchangeProperty.byteData}")
+					    .log("[9IN2][9] Converting byteData from Base64 to String (unmarshal)")
+					    .unmarshal().base64()
+					    .log("[9IN2][10] WebService Response transformed to cPRU format for ItemNumber:${exchangeProperty.itemNumber}: ${body}")
+					    .transform().simple("${body}")
+					    .log("[9IN2][11] Delivered WebService Response to cPRU (MultilevelWhereUsedAssemblyReport) !")
+					.otherwise()
+						.setBody().simple("${exchangeProperty.responseMessage}")
+						.log("[9IN2][12] WebService Response transformed to cPRU format for ItemNumber:${exchangeProperty.itemNumber}: ${body}")
+						.log("[9IN2][13] Agile WebService returned ::No Where Used Items:: for ItemNumber:${exchangeProperty.itemNumber}!!")
+						.transform().simple("${body}")
+						.log("[9IN2][14] Delivered WebService Response to cPRU (MultilevelWhereUsedAssemblyReport) !")
+				.endChoice()
+				
+				.log("[9IN2][15] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'GET'"))
+				.log("[9IN2][16] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform().simple("OK! GET endpoint reached for cPRU Inbound (MultilevelWhereUsedAssemblyReport)!!")
+				.log("[9IN2][17] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'PUT'"))
+				.log("[9IN2][18] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform().simple("OK! PUT endpoint reached for CPRU Inbound (MultilevelWhereUsedAssemblyReport)!!")
+				.log("[9IN2][19] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'DELETE'"))
+				.log("[9IN2][20] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform()
+				.simple("OK! DELETE endpoint reached for CPRU Inbound (MultilevelWhereUsedAssemblyReport)!!")
+				.log("[9IN2][21] AFTER METHOD: ${header.CamelHttpMethod}");
+
+		//9H10_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING
+		from("jetty:" + jettyCpruTmpBatAddUrl
+				+ "?restletMethods=GET,POST,PUT,DELETE&continuationTimeout=0")
+			.routeId("9H10_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING")
+			.setExchangePattern(ExchangePattern.InOnly)
+			.convertBodyTo(String.class)
+			.choice()
+			.when(simple("${header.CamelHttpMethod} == 'POST'"))
+				.log("[9H10][1] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.log("[9H10][2] Received message on ESB jetty server from CPRU for CreatePartWithECOnCreateMP")
+
+				.setHeader("CamelFileName", simple("CPRU_TS0015_${date:now:yyyyMMdd_HHmmss}"))
+				.process(new LogTraceProcessor())
+				
+				.to("file://" + archivePath + "9H10_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING")
+				.log("[9H10][3] Stored file to ARCHIVE folder: //" + archivePath
+						+ "9H10_FROM_CPRU_INBOUND_CREATE_TO_PRE_PROCESSING")
+				
+				.log("[9H10][4] Logging input string cPRU Message(CreatePartWithECOnCreateMP): ${body}")
+				.setProperty("InboundStringAsIs").simple("(${body})")
+				.setProperty("SourceSystem").simple("cPRU")
+				.setProperty("InboundType").simple("CREATE")
+				.convertBodyTo(String.class)
+//					Enclosing '&','<'and'>' within CDATA tag to form valid XML before transformation
+				
+				.setBody()
+					.groovy("request.body.replace(\"&amp;\",\"![CDATA[&amp;amp;]]\")")
+				.setBody()
+					.groovy("request.body.replace(\"&lt;\",\"![CDATA[&amp;lt;]]\")")
+				.setBody()
+					.groovy("request.body.replace(\"&gt;\",\"![CDATA[&amp;gt;]]\")")
+				.setBody()
+					.groovy("request.body.replace(\",-Unknown-|~|\",\",|~|\")")
+				.setBody()
+					.groovy("request.body.replace(\",!RESET|~|\",\",|~|\")")
+				.setBody()
+					.groovy("request.body.replace(\",-!Reset|~|\",\",|~|\")")
+				.setBody()
+					.groovy("request.body.replace(\",None|~|\",\",|~|\")")
+				.setBody()
+					.groovy("request.body.replace(\",Unassigned|~|\",\",|~|\")")
+				
+				.setBody(simple("<Inbound><Data>${body}</Data></Inbound>"))
+				
+				.log("[9H10][5] cPRU Inbound String (Create) Enclosed into XML Tag for Transformation: ${body}")
+				.to("xslt-saxon:file://" + xsltPath + "CPRU_to_Agile_Inbound_Transform.xslt?contentCache=false")
+				.log("[9H10][6] After transformation : ${body}")
+				.setBody()
+					.groovy("request.body.replace(\"![CDATA[&amp;amp;]]\",\"&lt;![CDATA[&amp;amp;]]&gt;\")")
+				.setBody()
+					.groovy("request.body.replace(\"![CDATA[&amp;lt;]]\",\"&lt;![CDATA[&amp;lt;]]&gt;\")")
+				.setBody()
+					.groovy("request.body.replace(\"![CDATA[&amp;gt;]]\",\"&lt;![CDATA[&amp;gt;]]&gt;\")")
+				
+				.log("[9H10][7] cPRU Inbound Message (Create) Transformed to Agile WS format :${body}")
+				.convertBodyTo(String.class)
+				.setHeader(CxfConstants.OPERATION_NAME, simple("CreatePartWithECOnCreateMP"))
+				.log("[9H10][8] Logging input to Agile WS: ${body}")
+				.log("[9H10][9] Invoking Agile web-service to send cPRU Message(CreatePartWithECOnCreateMP)!")
+				.log("[9H10][10] Url:"+inboundTs0015Url)
+				.to("cxf:bean:serviceEndpointCPRUBOM?wsdlURL=" + inboundTs0015Wsdl + "&dataFormat=PAYLOAD")
+				.log("[9H10][11] Delivered WebService Response to cPRU (CreatePartWithECOnCreateMP) ::${body} !!")
+				
+				.log("[9H10][12] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'GET'"))
+				.log("[9H10][13] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple(" OK! GET endpoint reached for cPRU Inbound (CREATE)!!"))
+				.log("[9H10][14] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'PUT'"))
+				.log("[9H10][15] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple("OK! PUT endpoint reached for cPRU Inbound (CREATE)!!"))
+				.log("[9H10][16] AFTER METHOD: ${header.CamelHttpMethod}")
+			.when(simple("${header.CamelHttpMethod} == 'DELETE'"))
+				.log("[9H10][17] BEFORE METHOD: ${header.CamelHttpMethod}")
+				.transform(simple("OK! DELETE endpoint reached for cPRU Inbound (CREATE)!!"))
+				.log("[9H10][18] AFTER METHOD: ${header.CamelHttpMethod}")
+			.endChoice();
+				
+    }
+	
+	@Bean
+	private CxfEndpoint serviceEndpointCPRUBOM() {
+		CxfEndpoint cxfEndpoint = null;
+		try {
+			CamelContext camelctx = new DefaultCamelContext();
+			CxfComponent component = new CxfComponent(camelctx);
+			cxfEndpoint = new CxfEndpoint(inboundTs0015Url, component);
+			cxfEndpoint.setBeanId("serviceEndpointCPRUBOM");
+			cxfEndpoint.setAddress(inboundTs0015Url);
+			cxfEndpoint.setWsdlURL(inboundTs0015Wsdl);
+			cxfEndpoint.setUsername(inboundTs0015UsernameCpru);
+			cxfEndpoint.setPassword(inboundTs0015PasswordCpru);
+			cxfEndpoint.setCxfConfigurer(anEndpointClientConfigurer());
+			cxfEndpoint.setCamelContext(camelctx);
+		} catch (Exception e) {
+			logger.error(e);
+		}
+
+		return cxfEndpoint;
+	}
+	
+	private CxfConfigurer anEndpointClientConfigurer() {
+		return new CxfConfigurer() {
+			@Override
+			public void configureServer(Server server) {
+				// TODO Auto-generated method stub
+			}
+
+			@Override
+			public void configureClient(Client client) {
+				// TODO Auto-generated method stub
+				HTTPConduit conduit = (HTTPConduit) client.getConduit();
+				HTTPClientPolicy policy = new HTTPClientPolicy();
+				policy.setReceiveTimeout(Integer.valueOf(cpruDuration));
+				policy.setConnectionTimeout(Integer.valueOf(cpruDuration));
+				conduit.setClient(policy);
+			}
+
+			@Override
+			public void configure(AbstractWSDLBasedEndpointFactory factoryBean) {
+				// TODO Auto-generated method stub
+			}
+		};
+	}
+	
+	@Bean
+	private CxfEndpoint serviceEndpointCPRUExportPart() {
+		CxfEndpoint cxfEndpoint = null;
+		try {
+			CamelContext camelctx = new DefaultCamelContext();
+			CxfComponent component = new CxfComponent(camelctx);
+			cxfEndpoint = new CxfEndpoint(epxUrl, component);
+			cxfEndpoint.setBeanId("serviceEndpointCPRUExportPart");
+			cxfEndpoint.setAddress(epxUrl);
+			cxfEndpoint.setWsdlURL(epxWsdl);
+			cxfEndpoint.setUsername(epxUsername);
+			cxfEndpoint.setPassword(epxPassword);
+
+			cxfEndpoint.setCamelContext(camelctx);
+		} catch (Exception e) {
+			logger.error(e);
+		}
+
+		return cxfEndpoint;
+	}
+	
+	@Bean
+	private CxfEndpoint serviceEndpointAgileMultilevel() {
+		CxfEndpoint cxfEndpoint = null;
+		try {
+			CamelContext camelctx = new DefaultCamelContext();
+			CxfComponent component = new CxfComponent(camelctx);
+			cxfEndpoint = new CxfEndpoint(mwurUrl, component);
+			cxfEndpoint.setBeanId("serviceEndpointAgileMultilevel");
+			cxfEndpoint.setAddress(mwurUrl);
+			cxfEndpoint.setWsdlURL(mwurWsdl);
+			cxfEndpoint.setUsername(mwurUsername);
+			cxfEndpoint.setPassword(mwurPassword);
+
+			cxfEndpoint.setCamelContext(camelctx);
+		} catch (Exception e) {
+			logger.error(e);
+		}
+		return cxfEndpoint;
+	}
+	
+}
+==========
+package com.amd.esb.agile.config;
+
+import org.apache.camel.component.amqp.AMQPComponent;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.qpid.jms.JmsConnectionFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class AmqpConfig {
+	private static final Logger logger = LogManager.getLogger(AmqpConfig.class);
+
+	@Value("${spring.activemq.broker-url}")
+	private String brokerURL;
+
+	@Value("${spring.activemq.user}")
+	private String amquser;
+
+	@Value("${spring.activemq.password}")
+	private String amqpasswd;
+
+	@Value("${com.amd.esb.agile.integration.amqp.jms.prefetchPolicy}")
+	private int prefetchPolicy;
+
+	@Bean
+	public JmsConnectionFactory connectionFactory() {
+		JmsConnectionFactory jmsConnectionFactory = new JmsConnectionFactory();
+		jmsConnectionFactory.setRemoteURI(brokerURL+"?jms.prefetchPolicy.all=" + prefetchPolicy);
+		jmsConnectionFactory.setUsername(amquser);
+		jmsConnectionFactory.setPassword(amqpasswd);
+		return jmsConnectionFactory;
+	}
+
+	@Bean
+	public AMQPComponent amqpComponent() {
+		AMQPComponent amqpComponent = new AMQPComponent();
+		amqpComponent.setConnectionFactory(connectionFactory());
+		amqpComponent.setArtemisStreamingEnabled(true);
+		amqpComponent.setTransacted(true);
+		amqpComponent.setReceiveTimeout(60000);
+		return amqpComponent;
+	}
+
+}
+=========
